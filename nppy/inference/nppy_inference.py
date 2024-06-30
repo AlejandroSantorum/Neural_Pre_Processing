@@ -11,65 +11,66 @@ import nibabel as nib
 from huggingface_hub import hf_hub_download
 from surfa import Volume
 
+GLOBAL_VERBOSE = False
 description = ''' 
 Neural Pre-processing (NPP) converts Head MRI images
 to an intensity-normalized, skull-stripped brain in a standard coordi-
 nate space. If you use NPP in your analysis, please cite:
 '''
 
-def main():
-    # parse command line
-    parser = argparse.ArgumentParser(description=description)
-    parser.add_argument('-i', '--input_folder', metavar='folder_path', required=True, help='Input folder to pre-processing.')
-    parser.add_argument('-o', '--output_folder', metavar='folder_path', help='Save stripped image to the output folder.')
-    parser.add_argument('-w', '--weight', metavar='float', help='Smoothness of intensity normalization mapping. The range of smoothness is [-3,2],'
-                                                                ' where a larger value implies a higher degree of smoothing',default =-1)
-    parser.add_argument('-s', '--field', action='store_true', help='Save the scalar field map.')
-    parser.add_argument('-g', '--gpu', action='store_true', help='Use the GPU.')
+if GLOBAL_VERBOSE:
+    print(
+        'If you use Neural Pre-processing in your analysis and find it useful, please cite: \n'
+        'He, X., Wang, A.Q., Sabuncu, M.R. (2023). Neural Pre-processing: A Learning Framework for End-to-End Brain MRI Pre-processing. \n'
+        'In: Greenspan, H., et al. Medical Image Computing and Computer Assisted Intervention – MICCAI 2023. MICCAI 2023. \n'
+        'Lecture Notes in Computer Science, vol 14227. Springer, Cham. https://doi.org/10.1007/978-3-031-43993-3_25'
+    )
 
-    if len(sys.argv) == 1:
-        parser.print_help()
-        exit(1)
 
-    args = parser.parse_args()
-
-    # args.input_folder = '/Users/hexinzi/Downloads/input'
-    # args.output_folder = '/Users/hexinzi/Downloads/output'
-    # args.weight = -1
-    # args.gpu = True
-    # args.field = False
+def run_nppy_inference(
+    input_folder: str,
+    output_folder: str = None,
+    weight: float = -1,
+    gpu: bool = True,
+    field: bool = False,
+):
     # download the model
     #project_dir = os.path.dirname(os.path.abspath(__file__))
     checkpoint_path = hf_hub_download(repo_id="hexinzi/NeuralPreProcessing", filename="npp_v1.pth")
 
     #if input_folder is file, convert to folder
-    if os.path.isfile(args.input_folder):
-        args.input_folder = os.path.dirname(args.input_folder)
+    if os.path.isfile(input_folder):
+        input_folder = os.path.dirname(input_folder)
 
     # if input and output are same, exit
-    if args.input_folder == args.output_folder:
+    if input_folder == output_folder:
         sf.system.fatal('Input and output folders are same. Exiting.')
 
     # find all dicom folders and nii files, generate output file path and print it
-    dicom_folders_path = find_dicom_folders(args.input_folder)
-    nii_files_path = find_nii_files(args.input_folder)
+    dicom_folders_path = find_dicom_folders(input_folder)
+    nii_files_path = find_nii_files(input_folder)
     input_image_path = dicom_folders_path + nii_files_path
-    relative_input_image_path = [os.path.splitext(os.path.relpath(i,args.input_folder))[0] for i in input_image_path]
-    out_file_path_without_extension = [os.path.join(args.output_folder, i) if input_image_path[ind] in nii_files_path else os.path.join(args.output_folder, i,'dicom') for ind,i in enumerate (relative_input_image_path)  ]
+    relative_input_image_path = [os.path.splitext(os.path.relpath(i, input_folder))[0] for i in input_image_path]
+    out_file_path_without_extension = [
+        os.path.join(output_folder, i)
+        if input_image_path[ind] in nii_files_path
+        else os.path.join(output_folder, i, 'dicom')
+        for ind,i in enumerate (relative_input_image_path)
+    ]
 
     print(f'input_folder path:\n',"\n".join(relative_input_image_path))
 
     # sanity check on the inputs
-    if not args.output_folder:
+    if not output_folder:
         sf.system.fatal('Must provide at least --output_folder output flags.')
-    elif not os.path.exists(os.path.dirname(args.output_folder)):
+    elif not os.path.exists(os.path.dirname(output_folder)):
         print('Output directory does not exist. Create output directory.')
-        os.makedirs(os.path.dirname(args.output_folder),exist_ok=True)
+        os.makedirs(os.path.dirname(output_folder),exist_ok=True)
 
-    # check args.weight is in the range and float
-    if args.weight:
-        args.weight = float(args.weight)
-        if args.weight < -3 or args.weight > 2:
+    # check weight is in the range and float
+    if weight:
+        weight = float(weight)
+        if weight < -3 or weight > 2:
             sf.system.fatal('The range of smoothness should within [-3,2], where a larger value implies a higher degree of smoothing')
 
     # necessary for speed gains (I think)
@@ -81,7 +82,7 @@ def main():
     is_mps_available = torch.backends.mps.is_available()
     is_gpu_available = torch.cuda.is_available()
 
-    if args.gpu and is_gpu_available:
+    if gpu and is_gpu_available:
         os.environ['CUDA_VISIBLE_DEVICES'] = '0'
         device = torch.device('cuda')
         device_name = 'GPU'
@@ -137,7 +138,7 @@ def main():
         # predict the surface distance transform
         with torch.no_grad():
             input_tensor = torch.from_numpy(conformed.data[np.newaxis, np.newaxis]).to(device)
-            output = model(input_tensor,args.weight)
+            output = model(input_tensor, weight)
             mni_norm = output[0].cpu().numpy().squeeze().astype(np.int16)
             norm = output[1].cpu().numpy().squeeze().astype(np.int16)
             scalar_field = output[2].cpu().numpy().squeeze().astype(np.float32)
@@ -155,11 +156,44 @@ def main():
             nib.save(mni_norm_nib_handler, output_path+'_mni_norm.nii.gz')
             conformed.save(output_path+'_orig.nii.gz')
             norm.save(output_path+'_norm.nii.gz')
-            if args.field:
+            if field:
                 scalar_field.save(output_path+'_scalar_field.nii.gz')
-            print(f'Results saved to: {args.output_folder}')
+            print(f'Results saved to: {output_folder}')
 
-    print('If you use Neural Pre-processing in your analysis and find it useful, please cite: \n'
-          'He, X., Wang, A.Q., Sabuncu, M.R. (2023). Neural Pre-processing: A Learning Framework for End-to-End Brain MRI Pre-processing. \n'
-          'In: Greenspan, H., et al. Medical Image Computing and Computer Assisted Intervention – MICCAI 2023. MICCAI 2023. \n'
-          'Lecture Notes in Computer Science, vol 14227. Springer, Cham. https://doi.org/10.1007/978-3-031-43993-3_25')
+
+if __name__ == '__main__':
+    # args.input_folder = '/Users/hexinzi/Downloads/input'
+    # args.output_folder = '/Users/hexinzi/Downloads/output'
+    # args.weight = -1
+    # args.gpu = True
+    # args.field = False
+
+    # parse command line
+    parser = argparse.ArgumentParser(description=description)
+    parser.add_argument(
+        '-i', '--input_folder', metavar='folder_path', required=True, help='Input folder to pre-processing.'
+    )
+    parser.add_argument(
+        '-o', '--output_folder', metavar='folder_path',
+        help='Save stripped image to the output folder.'
+    )
+    parser.add_argument(
+        '-w', '--weight', metavar='float', default=-1,
+        help='Smoothness of intensity normalization mapping. The range of smoothness is [-3,2], where a larger value implies a higher degree of smoothing',
+    )
+    parser.add_argument('-s', '--field', action='store_true', help='Save the scalar field map.')
+    parser.add_argument('-g', '--gpu', action='store_true', help='Use the GPU.')
+
+    if len(sys.argv) == 1:
+        parser.print_help()
+        exit(1)
+
+    args = parser.parse_args()
+
+    run_nppy_inference(
+        input_folder=args.input_folder,
+        output_folder=args.output_folder,
+        weight=args.weight,
+        gpu=args.gpu,
+        field=args.field,
+    )
